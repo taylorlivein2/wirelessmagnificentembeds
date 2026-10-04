@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Spotify Playlist Updater</title>
+</head>
+<body>
+
+<form>
+	  <label for="sinceDate">Since:</label>
+	  <input type="date" id="sinceDate" name="sinceDate">
+		<br><br>
+	  <input type="radio" id="following" name="followingOrFuture" value="following">
+    <label for="following">Following</label>
+    <br>
+    <input type="radio" id="future" name="followingOrFuture" value="future">
+    <label for="future">Future</label><br><br>
+	</form>
+<button type="button" onClick='Go()'>Submit</button>
+
+<script>
+// ==============================
+// CONFIG
+// ==============================
+const clientId = "535c95463e2442349ffd910a094dd03b";
+const redirectUri = "https://wirelessmagnificentembeds.linkyhost.com";
+const scopes =
+  "user-follow-read playlist-modify-public playlist-modify-private user-read-private user-read-email playlist-read-private";
+const MARKET = "GB";
+const PLAYLIST_CHUNK = 75;
+
+// ==============================
+// PRINT HELPER
+// ==============================
+function print(msg, id) {
+  if (id == null) {
+    id = "msg" + generateRandomString(50);
+  }
+  let existing = document.getElementById(id);
+  if (existing != null)
+  {
+    existing.innerHTML = msg;
+  }
+  else
+  {
+    document.body.innerHTML += "<br/><span id='" + id + "'>" + msg + "</span>";
+  }
+  console.log(msg);
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+// ==============================
+// PKCE AUTH HELPERS
+// ==============================
+function generateRandomString(len) {
+  const chars =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let str = "";
+  for (let i = 0; i < len; i++)
+    str += chars.charAt(Math.floor(Math.random() * chars.length));
+  return str;
+}
+
+function base64url(buf) {
+  return btoa(String.fromCharCode.apply(null, new Uint8Array(buf)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+async function sha256(bytes) {
+  return crypto.subtle.digest("SHA-256", bytes);
+}
+
+async function startAuth() {
+  const verifier = generateRandomString(128);
+  sessionStorage.setItem("code_verifier", verifier);
+
+  const challenge = base64url(await sha256(new TextEncoder().encode(verifier)));
+
+  window.location =
+    "https://accounts.spotify.com/authorize?" +
+    new URLSearchParams({
+      response_type: "code",
+      client_id: clientId,
+      scope: scopes,
+      redirect_uri: redirectUri,
+      code_challenge_method: "S256",
+      code_challenge: challenge,
+      show_dialog: "true",
+    }).toString();
+}
+
+async function getTokenFromCode() {
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get("code");
+  if (!code) return null;
+
+  const verifier = sessionStorage.getItem("code_verifier");
+
+  const body = new URLSearchParams({
+    client_id: clientId,
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: redirectUri,
+    code_verifier: verifier,
+  });
+
+  const resp = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  });
+
+  const data = await resp.json();
+  if (data.access_token) {
+    sessionStorage.setItem("spotify_token", data.access_token);
+    return data.access_token;
+  }
+
+  return null;
+}
+
+// ==============================
+// GLOBAL RATE-LIMIT MANAGER
+// ==============================
+
+let requestQueue = [];
+let processing = false;
+let globalDelay = 0; // dynamically increased when 429 occurs
+
+function sleep(ms) {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
+async function queueRequest(task) {
+  return new Promise((resolve, reject) => {
+    requestQueue.push({ task, resolve, reject });
+    if (!processing) processQueue();
+  });
+}
+
+async function processQueue() {
+  processing = true;
+
+  while (requestQueue.length > 0) {
+    const { task, resolve, reject } = requestQueue.shift();
+
+    if (globalDelay > 0) {
+      print(`Waiting ${globalDelay}ms due to prior 429...`);
+      await sleep(globalDelay);
+    }
+
+    try {
+      const result = await task();
+      resolve(result);
+    } catch (err) {
+      reject(err);
+    }
+  }
+
+  processing = false;
+}
+
+// Spotify-safe HTTP wrapper
+async function safeFetch(url, method = "GET", body = null, options = {}) {
+  return await queueRequest(async () => {
+    try {
+      const resp = await fetch(url, {
+        method,
+        headers: options,
+        body,
+      });
+
+      if (resp.status === 429) {
+        const retryAfter = parseInt(resp.headers.get("Retry-After")) || 2;
+        globalDelay = retryAfter * 1000;
+        print(`429 hit — retrying after ${retryAfter}s`);
+        await sleep(globalDelay);
+        globalDelay = 0;
+        return safeFetch(url, method, body, options);
+      }
+
+      if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error("HTTP " + resp.status + ": " + text);
+      }
+
+      return await resp.json();
+    } catch (err) {
+      print("Error: " + err.message);
+      throw err;
+    }
+  });
+}
+
+// ==============================
+// SUBMITTING
+// ==============================
+function Go() {
+  sessionStorage.setItem("followingOrFuture", document.querySelector("input[name=\"followingOrFuture\"]:checked")?.value || "following");
+  sessionStorage.setItem("sinceDate", (document.getElementById("sinceDate").value || new Date()).toString());
+  startAuth();
+}
+
+// ==============================
+// MAIN SCRIPT
+// ==============================
+
+function displayChoice() {
+  const dateInput = document.getElementById("sinceDate");
+	// Format to YYYY-MM-DD
+	const formatted = new Date(sessionStorage.getItem("sinceDate") || new Date().toString()).toISOString().split('T')[0];
+	dateInput.value = formatted;
+
+	let defaultValue = sessionStorage.getItem("followingOrFuture") || "following";
+		document.getElementsByName("followingOrFuture").forEach(radio => {
+	  if (radio.value === defaultValue) {
+		radio.checked = true;
+	  }
+	});
+}
+
+window.document.onload = displayChoice;
+displayChoice();
+
+async function main() {
+  
+  const dateInput = document.getElementById("sinceDate");
+  let defaultValue = sessionStorage.getItem("followingOrFuture") || "following";
+  let cutoff = new Date(sessionStorage.getItem("sinceDate") || new Date().toString()).toISOString().split('T')[0];
+  displayChoice();
+
+  let token = sessionStorage.getItem("spotify_token");
+  if (!token) token = await getTokenFromCode();
+  if (!token) return;// startAuth();
+
+  let UsingFollowedArtists = defaultValue != "future";
+
+  const options = {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    Authorization: "Bearer " + token,
+  };
+
+  // ---------------------------------------------
+  // GET USER
+  // ---------------------------------------------
+  const me = await safeFetch("https://api.spotify.com/v1/me", "GET", null, options);
+  const userId = me.id;
+  print("Logged in as: " + userId);
+  displayChoice();
+
+  // ---------------------------------------------
+  // GET ARTISTS
+  // ---------------------------------------------
+  let artists = [];
+  let next = "";
+  
+  if (UsingFollowedArtists)
+  {
+    next = "https://api.spotify.com/v1/me/following?type=artist&limit=50";
+
+    while (next) {
+      const data = await safeFetch(next, "GET", null, options);
+      artists = artists.concat(data.artists.items);
+      next = data.artists.next;
+    }
+    print(`Artists: ${artists.map(a => a.name).join("#")}`);
+    print(`Followed artists: ${artists.length}`);
+
+    if (artists.length === 0) return print("No followed artists.");
+
+    // Create a "Fave Artists Revisited" playlist
+    let faveArtistsRevisited = [];
+    /*for (const artist of artists) {
+      let data = await safeFetch("https://api.spotify.com/v1/artists/"+artist.id+"/top-tracks?market=GB", "GET", null, options);
+      let OnlyTHEIRTopTracks = data.tracks.filter(x => x!=null && x.artists!=null && x.artists.length>0 && x.artists[0].id==artist.id);
+      if (OnlyTHEIRTopTracks.length == 0)
+      {
+        console.log("couldn't get " + artist.name);
+      }
+      else 
+      {
+        faveArtistsRevisited.push(OnlyTHEIRTopTracks[0]);
+      }
+    }*/
+
+    if (faveArtistsRevisited.length > 0)
+    {
+      faveArtistsRevisited = faveArtistsRevisited.reverse();
+      let name = "Fave Artists Revisited - " + new Date().toLocaleDateString("en-GB");
+      let description = faveArtistsRevisited.length.toString();
+
+      let playlist = await safeFetch(
+        `https://api.spotify.com/v1/users/${userId}/playlists`,
+        "POST",
+        JSON.stringify({ name, description, public: false }),
+        options
+      );
+
+      let playlistId = playlist.id;
+
+      // ---------------------------------------------
+      // ADD TRACKS IN BATCHES
+      // ---------------------------------------------
+      for (let i = 0; i < faveArtistsRevisited.length; i += PLAYLIST_CHUNK) {
+        const chunk = faveArtistsRevisited.slice(i, i + PLAYLIST_CHUNK).map((t) => t.uri);
+
+        await safeFetch(
+          `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
+          "POST",
+          JSON.stringify({ uris: chunk }),
+          options
+        );
+
+        print(`Added ${i + chunk.length}/${faveArtistsRevisited.length}`);
+      }
+    }
+  }
+  else
+  {
+    // Get artist IDs and Names from playlists
+
+    // First get all playlists in Future Discographies and New Collections
+    /*
+      "New Music"
+      (artist names within new collections)
+      ...
+      "(Pop Punk - Complete)"
+      "--------------------------------- (22/06/2025)"
+      …
+      (Artist names, some separated by "/")
+      ...
+      "Live Albums"
+    */
+
+    var playlists = [];
+
+    next = "https://api.spotify.com/v1/me/playlists?limit=50&offset=0";
+    while (next) {
+        const data = await safeFetch(next, "GET", null, options);
+        playlists = playlists.concat(data.items);
+        next = data.next;
+    }
+
+    if (playlists.length > 0)
+    {
+        var filteredPlaylists = [];
+        var includeInPlaylist = false;
+        playlists.forEach(function(playlist) {
+            if (["(Pop Punk - Complete)", "Live Albums"].includes(playlist.name)) {
+                includeInPlaylist = !includeInPlaylist;
+            }
+            if (includeInPlaylist) {
+                filteredPlaylists.push(playlist);
+            }
+            if (["New Music"].includes(playlist.name) || playlist.name.startsWith("--------------------------------- ")) {
+                includeInPlaylist = !includeInPlaylist;
+            }
+        });
+
+        if (filteredPlaylists.length > 0) 
+        {
+          let artistNames = [];
+          filteredPlaylists.forEach(function(playlist) {
+              artistNames = artistNames.concat(playlist.name.split(" / ").filter(x => x.trim().length > 0).map(x => x.trim()));
+          });
+          for (const artistName of artistNames) {
+              // Get artist ID via name
+              const url = "https://api.spotify.com/v1/search?q=" + encodeURIComponent(artistName.toUpperCase()) + "&type=artist&market=GB&limit=5&offset=0";
+              const res = await safeFetch(url, "GET", null, options);
+              if (res.artists && res.artists.items && res.artists.items.length > 0) {
+                  artists.push({
+                      name: res.artists.items[0].name,
+                      id: res.artists.items[0].id
+                  });
+              }
+          }
+        }
+    }
+
+    if (artists.length === 0) return print("No artists :(");
+  }
+
+  cutoff = new Date(cutoff); //new Date();
+  //cutoff.setDate(cutoff.getDate() - 6);
+
+  // ---------------------------------------------
+  // FETCH RELEASES FOR ALL ARTISTS (WITH appears_on)
+  // ---------------------------------------------
+  const groups = ["album", "single", "compilation", "appears_on"];
+  let releases = [];
+
+  let count = 0;
+  for (const artist of artists) {
+    for (const group of groups) {
+      const url =
+        `https://api.spotify.com/v1/artists/${artist.id}/albums` +
+        `?include_groups=${group}&market=${MARKET}&limit=10`;
+
+      const res = await safeFetch(url, "GET", null, options);
+
+      if (res.items) {
+        for (const item of res.items) {
+          if (
+            new Date(item.release_date) > cutoff &&
+            item.artists[0].name !== "Various Artists"
+          ) {
+            releases.push({ release: item, artist });
+          }
+        }
+      }
+    }
+
+    count++;
+    print(`Checked artist ${count}/${artists.length}`, 'artistcounter');
+  }
+
+  print(`New releases found: ${releases.length}`);
+  if (releases.length === 0) return print("Nothing new.");
+
+  // ---------------------------------------------
+  // COLLECT TRACKS
+  // ---------------------------------------------
+  let tracks = [];
+
+  for (const r of releases) {
+    let url = `${r.release.href}/tracks?market=${MARKET}&limit=50`;
+
+    while (url) {
+      const data = await safeFetch(url, "GET", null, options);
+      url = data.next;
+
+      if (data.items) {
+        data.items.forEach((t) => {
+          if (t.artists.some((a) => a.id === r.artist.id)) {
+            tracks.push(t);
+          }
+        });
+      }
+    }
+  }
+
+  print(`Tracks found: ${tracks.length}`);
+  if (tracks.length === 0) return print("No tracks to add.");
+
+  // ---------------------------------------------
+  // CREATE PLAYLIST
+  // ---------------------------------------------
+  const name = new Date().toLocaleDateString("en-GB");
+  const description = `${tracks.length} new track${tracks.length === 1 ? "" : "s"}`;
+
+  const playlist = await safeFetch(
+    `https://api.spotify.com/v1/users/${userId}/playlists`,
+    "POST",
+    JSON.stringify({ name, description, public: false }),
+    options
+  );
+
+  const playlistId = playlist.id;
+  print("Playlist created: " + playlistId);
+
+  // ---------------------------------------------
+  // ADD TRACKS IN BATCHES
+  // ---------------------------------------------
+  for (let i = 0; i < tracks.length; i += PLAYLIST_CHUNK) {
+    const chunk = tracks.slice(i, i + PLAYLIST_CHUNK).map((t) => t.uri);
+
+    await safeFetch(
+      `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
+      "POST",
+      JSON.stringify({ uris: chunk }),
+      options
+    );
+
+    print(`Added ${i + chunk.length}/${tracks.length}`);
+  }
+
+  print("Playlist creation complete!");
+}
+
+main();
+displayChoice();
+</script>
+</body>
+</html>
